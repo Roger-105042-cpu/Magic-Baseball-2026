@@ -1,6 +1,0 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg[binary]
-argon2-cffi
-openpyxl
