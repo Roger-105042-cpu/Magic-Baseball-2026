@@ -2,7 +2,7 @@ services:
   - type: web
     name: magic-baseball-web
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
@@ -22,6 +22,6 @@ services:
 
 databases:
   - name: magic-baseball-db
-    plan: basic-256mb
+    plan: free
     databaseName: magic_baseball
     user: magic_baseball
