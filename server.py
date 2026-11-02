@@ -107,13 +107,14 @@ def students(db=Depends(dbdep),u=Depends(auth)):
  q=select(Student).order_by(Student.campus,Student.number)
  if u.role=='parent':q=q.where(Student.id==u.student_id)
  return [public(db,s) for s in db.scalars(q)]
-class StudentIn(BaseModel):name:str;number:str='';campus:str='仁德學院';parentName:str='';parentPhone:str;password:str;studentType:str='新生';planType:str='A';purchaseDate:str
+class StudentIn(BaseModel):name:str;number:str='';campus:str='仁德學院';parentName:str='';parentPhone:str;password:str;studentType:str='新生';planType:str='A';purchaseDate:str;equipment:dict|None=None
 @app.post('/api/students')
 def addstudent(p:StudentIn,db=Depends(dbdep),u=Depends(auth)):
  roles(u,'admin','superadmin');pwcheck(p.password)
+ if not p.name.strip() or not p.parentPhone.strip():raise HTTPException(400,'請填寫學員姓名與家長手機')
  if p.planType not in ('A','B'):raise HTTPException(400,'方案錯誤')
  if db.scalar(select(User).where(User.username==p.parentPhone)):raise HTTPException(409,'家長帳號已存在，暫不支援共用手機多位學員')
- c,l,m=(11,4,4) if p.planType=='A' else (12,8,6);s=Student(name=p.name,number=p.number,campus=p.campus,parentName=p.parentName,parentPhone=p.parentPhone,studentType=p.studentType,planType=p.planType,purchaseDate=p.purchaseDate,expiryDate=month(p.purchaseDate,m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment=eqdefault());db.add(s);db.flush();db.add(User(username=p.parentPhone,name=p.parentName or p.name,role='parent',password_hash=ph.hash(p.password),student_id=s.id));log(db,u,'add_student',s.id);db.commit();return {'id':s.id}
+ c,l,m=(11,4,4) if p.planType=='A' else (12,8,6);s=Student(name=p.name,number=p.number,campus=p.campus,parentName=p.parentName,parentPhone=p.parentPhone,studentType=p.studentType,planType=p.planType,purchaseDate=p.purchaseDate,expiryDate=month(p.purchaseDate,m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment={k:{'size':str((p.equipment or {}).get(k,{}).get('size',''))[:30],'issued':False,'date':''} for k in eqdefault()});db.add(s);db.flush();db.add(User(username=p.parentPhone,name=p.parentName or p.name,role='parent',password_hash=ph.hash(p.password),student_id=s.id));log(db,u,'add_student',s.id);db.commit();return {'id':s.id}
 class AttendanceIn(BaseModel):date:str;status:str;note:str=''
 @app.post('/api/students/{sid}/attendance')
 def attendance(sid:str,p:AttendanceIn,db=Depends(dbdep),u=Depends(auth)):
