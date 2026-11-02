@@ -115,6 +115,37 @@ def addstudent(p:StudentIn,db=Depends(dbdep),u=Depends(auth)):
  if p.planType not in ('A','B'):raise HTTPException(400,'方案錯誤')
  if db.scalar(select(User).where(User.username==p.parentPhone)):raise HTTPException(409,'家長帳號已存在，暫不支援共用手機多位學員')
  c,l,m=(11,4,4) if p.planType=='A' else (12,8,6);s=Student(name=p.name,number=p.number,campus=p.campus,parentName=p.parentName,parentPhone=p.parentPhone,studentType=p.studentType,planType=p.planType,purchaseDate=p.purchaseDate,expiryDate=month(p.purchaseDate,m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment={k:{'size':str((p.equipment or {}).get(k,{}).get('size',''))[:30],'issued':False,'date':''} for k in eqdefault()});db.add(s);db.flush();db.add(User(username=p.parentPhone,name=p.parentName or p.name,role='parent',password_hash=ph.hash(p.password),student_id=s.id));log(db,u,'add_student',s.id);db.commit();return {'id':s.id}
+# Account names are viewable by staff; password hashes and plaintext passwords are never returned.
+@app.get('/api/students/{sid}/account')
+def student_account(sid:str,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ st=student(db,sid)
+ account=db.scalar(select(User).where(User.student_id==st.id,User.role=='parent'))
+ return {'username':account.username if account else st.parentPhone,'active':bool(account and account.active),'hasAccount':bool(account)}
+class ResetStudentPassword(BaseModel):newPassword:str
+@app.post('/api/students/{sid}/reset-password')
+def reset_student_password(sid:str,p:ResetStudentPassword,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'superadmin');pwcheck(p.newPassword)
+ st=student(db,sid,True)
+ account=db.scalar(select(User).where(User.student_id==st.id,User.role=='parent'))
+ if not account:raise HTTPException(404,'此學員尚無家長登入帳號')
+ account.password_hash=ph.hash(p.newPassword)
+ for sess in db.scalars(select(SessionToken).where(SessionToken.user_id==account.id)).all():db.delete(sess)
+ log(db,u,'reset_parent_password',sid)
+ db.commit();return {'ok':True}
+@app.delete('/api/students/{sid}')
+def delete_student(sid:str,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'superadmin')
+ st=student(db,sid,True)
+ # Remove dependents explicitly so the operation works without a schema migration.
+ accounts=db.scalars(select(User).where(User.student_id==sid)).all()
+ for account in accounts:
+  for sess in db.scalars(select(SessionToken).where(SessionToken.user_id==account.id)).all():db.delete(sess)
+  db.delete(account)
+ for model in (Attendance,Renewal):
+  for record in db.scalars(select(model).where(model.student_id==sid)).all():db.delete(record)
+ log(db,u,'delete_student',sid,st.name)
+ db.delete(st);db.commit();return {'ok':True}
 class AttendanceIn(BaseModel):date:str;status:str;note:str=''
 @app.post('/api/students/{sid}/attendance')
 def attendance(sid:str,p:AttendanceIn,db=Depends(dbdep),u=Depends(auth)):
@@ -192,3 +223,80 @@ def export(db=Depends(dbdep),u=Depends(auth)):
  for s in db.scalars(select(Student)):
   for k,v in (s.equipment or {}).items():sh.append([s.id,k,v.get('size',''),v.get('issued',False),v.get('date','')])
  b=io.BytesIO();w.save(b);b.seek(0);return StreamingResponse(b,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="magic_baseball.xlsx"'})
+
+
+# Bulk Excel import: single transaction; no plaintext passwords in spreadsheets.
+IMPORT_HEADERS = ['學員姓名','背號','場域','家長姓名','家長電話','新舊生','方案','購買生效日','制服尺寸','球褲尺寸','練習衣尺寸']
+@app.get('/api/students/import-template.xlsx')
+def import_template(u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ from openpyxl import Workbook
+ w=Workbook();sh=w.active;sh.title='學員匯入';sh.append(IMPORT_HEADERS)
+ sh.append(['測試學員','15','仁德學院','測試家長','0900000000','新生','A','2026-11-02','140','140','M'])
+ sh.freeze_panes='A2'
+ for col in sh.columns:
+  sh.column_dimensions[col[0].column_letter].width=20
+ sh2=w.create_sheet('使用說明');sh2.append(['僅上傳 .xlsx；第一列欄名請勿修改。範例第二列請刪除後再匯入。']);sh2.append(['不含密碼：匯入的家長帳號預設停用，需由超級管理員重設密碼並啟用。']);sh2.append(['同一檔案內或資料庫中家長電話重複，整批拒絕，不會寫入部分資料。']);sh2.append(['方案 A：11 堂/4 個月/4 次請假；方案 B：12 堂/6 個月/8 次請假。'])
+ b=io.BytesIO();w.save(b);b.seek(0)
+ return StreamingResponse(b,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="magic_students_import_template.xlsx"'})
+
+@app.post('/api/students/import.xlsx')
+async def import_students_excel(request:Request,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'admin','superadmin')
+ from openpyxl import load_workbook
+ from openpyxl.utils.datetime import from_excel
+ raw=await request.body()
+ if len(raw)>3_000_000:raise HTTPException(413,'檔案超過 3 MB 限制')
+ if not raw.startswith(b'PK') :raise HTTPException(400,'請上傳 .xlsx Excel 檔案')
+ try:
+  w=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+  sh=w['學員匯入'] if '學員匯入' in w.sheetnames else w.active
+  rows=sh.iter_rows(values_only=True)
+  header=[str(v).strip() if v is not None else '' for v in next(rows)]
+  missing=[h for h in IMPORT_HEADERS if h not in header]
+  if missing:raise HTTPException(400,'缺少欄位：'+', '.join(missing))
+  idx={h:header.index(h) for h in IMPORT_HEADERS}
+  prepared=[];errors=[];seen=set()
+  for excel_row,values in enumerate(rows,2):
+   if excel_row>502:raise HTTPException(400,'單次最多匯入 500 位學員')
+   if not any(v is not None and str(v).strip() for v in values):continue
+   def val(k):
+    i=idx[k];v=values[i] if i<len(values) else None
+    return str(v).strip() if v is not None else ''
+   name=val('學員姓名');phone=val('家長電話');campus=val('場域');plan=val('方案').upper().replace('方案','').strip();start=values[idx['購買生效日']] if idx['購買生效日']<len(values) else None
+   try:
+    if isinstance(start,(date,datetime)):start=start.date().isoformat() if isinstance(start,datetime) else start.isoformat()
+    else:start=str(start or '').strip();date.fromisoformat(start)
+   except (ValueError,TypeError):errors.append(f'第 {excel_row} 列：購買生效日格式應為 YYYY-MM-DD');continue
+   if not name or not re.fullmatch(r'09\d{8}',phone):errors.append(f'第 {excel_row} 列：姓名或家長手機格式錯誤');continue
+   if campus not in ('仁德學院','南英學院') or plan not in ('A','B'):errors.append(f'第 {excel_row} 列：場域或方案錯誤');continue
+   if phone in seen:errors.append(f'第 {excel_row} 列：檔案內家長手機重複');continue
+   seen.add(phone)
+   prepared.append(dict(name=name,number=val('背號'),campus=campus,parentName=val('家長姓名'),parentPhone=phone,studentType=val('新舊生') or '新生',planType=plan,purchaseDate=start,jersey=val('制服尺寸'),pants=val('球褲尺寸'),practiceShirt=val('練習衣尺寸')))
+  w.close()
+ except HTTPException:raise
+ except Exception:raise HTTPException(400,'無法讀取 Excel，請使用下載的範本並另存為 .xlsx')
+ if not prepared and not errors:raise HTTPException(400,'Excel 沒有學員資料')
+ if errors:raise HTTPException(400,'；'.join(errors[:12]))
+ for item in prepared:
+  if db.scalar(select(User.id).where(User.username==item['parentPhone'])) or db.scalar(select(Student.id).where(Student.parentPhone==item['parentPhone'])):
+   errors.append(item['name']+'：家長手機已存在 '+item['parentPhone'][-4:])
+ if errors:raise HTTPException(409,'；'.join(errors[:12])+'。本次未匯入任何資料')
+ for item in prepared:
+  c,l,m=(11,4,4) if item['planType']=='A' else (12,8,6)
+  eq=eqdefault()
+  for k in ('jersey','pants','practiceShirt'):eq[k]['size']=item[k]
+  st=Student(name=item['name'],number=item['number'],campus=item['campus'],parentName=item['parentName'],parentPhone=item['parentPhone'],studentType=item['studentType'],planType=item['planType'],purchaseDate=item['purchaseDate'],expiryDate=month(item['purchaseDate'],m),totalClasses=c,remainingClasses=c,totalLeaves=l,remainingLeaves=l,equipment=eq)
+  db.add(st);db.flush()
+  db.add(User(username=item['parentPhone'],name=item['parentName'] or item['name'],password_hash=ph.hash(secrets.token_urlsafe(32)),role='parent',active=False,student_id=st.id))
+  log(db,u,'excel_import_student',st.id)
+ db.commit()
+ return {'ok':True,'imported':len(prepared),'message':f'成功匯入 {len(prepared)} 位學員；家長帳號預設停用，請由超級管理員設定密碼並啟用'}
+
+@app.post('/api/students/{sid}/activate-parent')
+def activate_parent(sid:str,db=Depends(dbdep),u=Depends(auth)):
+ roles(u,'superadmin')
+ st=student(db,sid,True)
+ account=db.scalar(select(User).where(User.student_id==st.id,User.role=='parent'))
+ if not account:raise HTTPException(404,'找不到家長帳號')
+ account.active=True;log(db,u,'activate_parent',sid);db.commit();return {'ok':True}
