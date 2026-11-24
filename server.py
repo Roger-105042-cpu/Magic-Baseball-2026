@@ -90,8 +90,15 @@ async def lifespan(app):
  if initial:
   if not strong(initial):raise RuntimeError('BOOTSTRAP_ADMIN_PASSWORD 密碼強度不足')
   with Session() as db:
-   if not db.scalar(select(User).where(User.role=='superadmin')):
+   u=db.scalar(select(User).where(User.role=='superadmin'))
+   if not u:
     db.add(User(username=os.getenv('BOOTSTRAP_ADMIN_USERNAME','superadmin'),name='超級管理員',password_hash=ph.hash(initial),role='superadmin',active=True));db.commit()
+   elif os.getenv('FORCE_RESET_SUPERADMIN')=='1':
+    u.password_hash=ph.hash(initial)
+    u.active=True
+    for sess in db.scalars(select(SessionToken).where(SessionToken.user_id==u.id)).all():db.delete(sess)
+    db.add(Audit(actor='system',action='force_reset_superadmin',student_id='',detail=u.username))
+    db.commit()
  yield
 
 app=FastAPI(docs_url=None,redoc_url=None,lifespan=lifespan)
